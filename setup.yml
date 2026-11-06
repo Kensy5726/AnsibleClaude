@@ -1,0 +1,182 @@
+---
+- name: Reconstruction du serveur d'infrastructure
+  hosts: srv_lab
+  become: true
+  tasks:
+
+    # ----------------------------------------------------
+    # 1. Configuration des Paquets & Dépendances de base
+    # ----------------------------------------------------
+    - name: Installer les paquets système de base
+      ansible.builtin.apt:
+        name:
+          - curl
+          - git
+          - ca-certificates
+          - gnupg
+          - nftables
+          - iptables
+        state: present
+        update_cache: true
+
+    # ----------------------------------------------------
+    # 2. Configuration SSH
+    # ----------------------------------------------------
+    - name: Assurer la présence du fichier de config SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+        state: present
+      notify: Restart SSH
+
+    - name: S'assurer que le service SSH est activé et démarré
+      ansible.builtin.systemd:
+        name: ssh
+        state: started
+        enabled: true
+
+    # ----------------------------------------------------
+    # 3. Configuration Pare-feu (nftables - Avant Docker)
+    # ----------------------------------------------------
+    - name: Configurer les règles nftables
+      ansible.builtin.copy:
+        dest: /etc/nftables.conf
+        owner: root
+        group: root
+        mode: '0755'
+        validate: 'nft -c -f %s'
+        content: |
+          #!/usr/sbin/nft -f
+
+          # Ne pas utiliser "flush ruleset" : cela supprime aussi les chaînes de Docker.
+          # La première ligne garantit l'existence de la table avant sa suppression.
+          table inet filter
+          delete table inet filter
+
+          table inet filter {
+              chain input {
+                  type filter hook input priority filter; policy drop;
+                  iifname "lo" accept
+                  ct state established,related accept
+                  tcp dport 22 accept
+                  tcp dport { 80, 443 } accept
+              }
+              chain forward {
+                  type filter hook forward priority filter; policy accept;
+              }
+              chain output {
+                  type filter hook output priority filter; policy accept;
+              }
+          }
+      notify: Reload nftables
+
+    - name: Activer et démarrer le service nftables
+      ansible.builtin.systemd:
+        name: nftables
+        state: started
+        enabled: true
+
+    # ----------------------------------------------------
+    # 4. Installation et Configuration de Docker (Ubuntu)
+    # ----------------------------------------------------
+    - name: Créer le répertoire de clé GPG pour Docker
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Télécharger la clé GPG Docker (Ubuntu)
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Ajouter le dépôt Docker (Format deb822 pour Ubuntu)
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/ubuntu
+        suites: "{{ ansible_distribution_release }}"
+        components: stable
+        architectures: amd64
+        signed_by: /etc/apt/keyrings/docker.asc
+        state: present
+
+    - name: Installer Docker et ses composants
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+        update_cache: true
+
+    - name: Démarrer et activer le service Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Vérifier la présence de la chaîne DOCKER-FORWARD
+      ansible.builtin.command: iptables -t filter -nL DOCKER-FORWARD
+      register: docker_forward_chain
+      changed_when: docker_forward_chain.rc != 0
+      failed_when: false
+      notify: Restart Docker
+
+    - name: Appliquer les handlers avant le déploiement
+      ansible.builtin.meta: flush_handlers
+
+    # ----------------------------------------------------
+    # 5. Déploiement de la Plateforme (Docker Compose)
+    # ----------------------------------------------------
+    - name: Créer le dossier pour la plateforme
+      ansible.builtin.file:
+        path: /opt/plateforme
+        state: directory
+        mode: '0755'
+
+    - name: Copier le fichier docker-compose.yml
+      ansible.builtin.copy:
+        dest: /opt/plateforme/docker-compose.yml
+        mode: '0644'
+        content: |
+          services:
+            traefik:
+              image: traefik:v3.0
+              command:
+                - "--api.insecure=true"
+                - "--providers.docker=true"
+                - "--entrypoints.web.address=:80"
+              ports:
+                - "80:80"
+                - "8080:8080"
+              volumes:
+                - "/var/run/docker.sock:/var/run/docker.sock:ro"
+
+    - name: Lancer la stack Docker Compose
+      community.docker.docker_compose_v2:
+        project_src: /opt/plateforme
+        state: present
+
+  # ----------------------------------------------------
+  # Handlers pour appliquer les changements
+  # ----------------------------------------------------
+  handlers:
+    - name: Restart SSH
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+
+    - name: Reload nftables
+      ansible.builtin.systemd:
+        name: nftables
+        state: reloaded
+
+    - name: Restart Docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
