@@ -7,8 +7,8 @@ Pour l'envoi de la configuration vers la machine :
 ```ansible-playbook -i inventory.ini setup.yml```
 
 Le setup :
-    Configurer des Paquets & Dépendances de base
-    Configurer le SSH
-    Configurer Pare-feu
-    Installer docker
+    Configurer des Paquets & Dépendances de base; 
+    Configurer le SSH; 
+    Configurer Pare-feu; 
+    Installer docker; 
     Déploiement de la Plateforme
